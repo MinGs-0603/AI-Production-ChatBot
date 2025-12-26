@@ -1,176 +1,102 @@
 import streamlit as st
+import pandas as pd
+from supabase import create_client
 import requests
-import json
-import os
 
-# 💡 API 정보
-API_URL = 'https://ai.potens.ai/api/chat'
-# API_KEY는 보안상의 이유로 직접 노출하지 않고 환경 변수 사용을 권장하지만, 테스트를 위해 유지합니다.
-API_KEY = 'Bx5TQFcgJW76I3kmTnDfBrge4Mg117vv' 
+st.set_page_config(page_title="생산관리 AI 챗봇", layout="wide")
 
-# 📰 포텐스닷 API 호출 함수
-def get_potens_response(keyword):
+# --- [수정됨] 키를 코드에 직접 적지 않고, 서버 설정(Secrets)에서 가져옵니다 ---
+try:
+    SUPABASE_URL = st.secrets["supabase"]["url"]
+    SUPABASE_KEY = st.secrets["supabase"]["key"]
+    POTENS_API_KEY = st.secrets["potens"]["api_key"]
+except Exception as e:
+    st.error("🚨 서버에 비밀 키(Secrets)가 설정되지 않았습니다.")
+    st.stop()
+
+# DB 연결
+try:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    st.error(f"DB 연결 실패: {e}")
+    st.stop()
+
+# --- 이하 로직은 동일합니다 ---
+def fetch_production_data():
+    try:
+        response = supabase.table("production_plans")\
+            .select("*")\
+            .order("plan_date", desc=False)\
+            .limit(2000)\
+            .execute()
+        if response.data:
+            return pd.DataFrame(response.data)
+        return pd.DataFrame()
+    except Exception as e:
+        return pd.DataFrame()
+
+def ask_ai(query, df):
+    url = "https://ai.potens.ai/api/chat"
     headers = {
-        'Content-Type': 'application/json',
-        'Authorization': f'Bearer {API_KEY}'
+        "Content-Type": "application/json", 
+        "Authorization": f"Bearer {POTENS_API_KEY}"
     }
     
-    # 📌 기능 수정: 키워드 관련 최신 기사 5개를 요약해 달라고 구체적으로 요청하는 프롬프트
-    prompt_text = f"다음 키워드: '{keyword}'에 대한 최신 뉴스나 기사를 5개 찾아서, 각 기사를 간결하게 요약해주고 출처나 주요 내용을 표시해줘. 전체적으로 하나의 마크다운 문단으로 깔끔하게 작성해줘."
-    data = {"prompt": prompt_text}
+    if not df.empty:
+        summary = df.groupby(['plan_date', 'line', 'category'])['quantity'].sum().reset_index()
+        data_context = summary.to_string(index=False)
+    else:
+        data_context = "데이터가 없습니다."
+
+    system_prompt = f"""
+    당신은 공장 생산 계획을 관리하는 '수석 스케줄러 AI'입니다.
+    아래 [데이터베이스 요약]을 바탕으로 질문에 답변하세요.
     
+    [데이터베이스 요약]
+    {data_context}
+
+    [답변 규칙]
+    1. 데이터에 근거해서 답변하세요.
+    2. 구체적인 날짜, 라인, 수량을 언급하세요.
+    """
+
+    payload = {"prompt": f"{system_prompt}\n\n[사용자 질문]: {query}"}
+
     try:
-        response = requests.post(API_URL, headers=headers, data=json.dumps(data), timeout=60) # 타임아웃을 60초로 늘려 안정성 확보
-        response.raise_for_status() 
-        result = response.json()
-        
-        # 'content' 또는 'message' 필드를 확인하여 유효한 응답을 반환합니다.
-        if 'content' in result and result['content']:
-            return result['content']
-        elif 'message' in result and result['message']:
-            return result['message']
-        else:
-            return "[API_ERROR: Potens.ai API 응답에서 유효한 응답 필드를 찾을 수 없습니다.]"
-
-    except requests.exceptions.HTTPError as e:
-        return f"🚨 [HTTP ERROR {e.response.status_code}] API 호출 실패. 응답: {e.response.text}"
-    except requests.exceptions.RequestException as e:
-        return f"🚨 [NETWORK ERROR] API 호출 중 네트워크 문제가 발생했습니다: {e}"
+        response = requests.post(url, headers=headers, json=payload, timeout=45)
+        if response.status_code == 200:
+            return response.json().get('message', '오류')
+        return f"연결 실패: {response.text}"
     except Exception as e:
-        return f"🚨 [PROCESSING ERROR] 예기치 않은 처리 문제가 발생했습니다: {e}"
+        return f"통신 오류: {str(e)}"
 
+# 화면 UI
+st.title("🏭 생산계획 AI 관제 센터 (Web Ver)")
 
-# 🖼️ Streamlit 웹 인터페이스 구성 및 디자인 적용
-st.set_page_config(page_title="AI 기반 뉴스 요약 엔진", layout="centered", initial_sidebar_state="collapsed")
+col1, col2 = st.columns([1.5, 1])
+df_data = fetch_production_data()
 
-# --- 커스텀 CSS (가독성 최우선 및 파란색 계열 유지) ---
-st.markdown("""
-    <style>
-        /* 메인 색상 변수 설정 */
-        :root {
-            --primary-blue: #1E90FF; /* Dodgblue, 메인 파란색 */
-            --light-blue: #E3F2FD; /* Light Blue 50, 배경 강조색 */
-            --dark-blue: #1565C0; /* Blue 800, 진한 파란색 */
-            --text-color: #333333; /* 📌 글씨색을 진한 회색으로 설정 */
-        }
-        
-        /* 전체 배경색과 글씨색 설정 */
-        .stApp {
-            background-color: #FFFFFF; /* 흰색 배경 유지 */
-            color: var(--text-color); /* 📌 기본 글씨색을 진하게 설정 */
-        }
-        
-        /* 모든 텍스트의 기본 색상을 오버라이드 (가독성 확보) */
-        body, p, div, span, h1, h2, h3, h4, .stText {
-            color: var(--text-color) !important; 
-        }
+with col1:
+    st.subheader("💬 AI 스케줄러")
+    if "messages" not in st.session_state:
+        st.session_state.messages = [{"role": "assistant", "content": "안녕하세요! 무엇을 도와드릴까요?"}]
 
-        /* 제목 스타일 */
-        h1, h2, h3 {
-            color: var(--dark-blue) !important;
-        }
+    for msg in st.session_state.messages:
+        st.chat_message(msg["role"]).write(msg["content"])
 
-        /* 메인 헤더 스타일 */
-        .header-title {
-            text-align: center;
-            color: var(--primary-blue);
-            padding-top: 20px;
-            font-size: 2.5em;
-            font-weight: 700;
-        }
+    if prompt := st.chat_input("질문을 입력하세요"):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.chat_message("user").write(prompt)
+        with st.chat_message("assistant"):
+            with st.spinner("분석 중..."):
+                if df_data.empty:
+                    st.write("데이터가 없습니다.")
+                else:
+                    ans = ask_ai(prompt, df_data)
+                    st.write(ans)
+                    st.session_state.messages.append({"role": "assistant", "content": ans})
 
-        /* 설명 문구 스타일 */
-        .header-subtitle {
-            text-align: center;
-            color: #616161; 
-            margin-bottom: 40px;
-            font-size: 1.1em;
-        }
-
-        /* 입력 필드 스타일 */
-        .stTextInput > div > div > input {
-            border: 2px solid var(--primary-blue);
-            border-radius: 8px;
-            padding: 10px 15px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            color: var(--text-color); /* 입력 텍스트 색상도 명확하게 */
-        }
-        
-        /* 스피너 스타일 */
-        .stSpinner > div > div {
-            color: var(--primary-blue) !important;
-        }
-
-        /* 섹션 구분선 */
-        hr {
-            border-top: 3px solid var(--light-blue);
-            margin: 30px 0;
-        }
-        
-        /* 푸터 스타일 */
-        .footer {
-            position: fixed;
-            left: 0;
-            bottom: 0;
-            width: 100%;
-            background-color: var(--light-blue); 
-            color: var(--dark-blue);
-            text-align: center;
-            padding: 10px;
-            font-size: 0.85em;
-            border-top: 1px solid var(--primary-blue);
-            z-index: 100;
-        }
-    </style>
-""", unsafe_allow_html=True)
-
-# --- 헤더 및 검색창 섹션 ---
-with st.container(border=False):
-    st.markdown("<div class='header-title'>📰 AI 기반 뉴스 요약 엔진</div>", unsafe_allow_html=True)
-    st.markdown("<div class='header-subtitle'>Potens.ai Chat API를 활용하여 입력 키워드에 대한 최신 기사 5개를 요약합니다.</div>", unsafe_allow_html=True)
-
-    search_keyword = st.text_input(
-        "키워드 입력", 
-        key="keyword_input",
-        placeholder="검색할 키워드를 입력하고 엔터를 누르세요 (예: 전력, AI 반도체)",
-        label_visibility="collapsed"
-    )
-
-# --- 결과 섹션 ---
-if search_keyword:
-    st.markdown("---") 
-    
-    tab1, tab2 = st.tabs(["💡 뉴스 요약 결과", "🛠️ API 상세"])
-
-    with tab1:
-        with st.container(border=True): 
-            st.markdown(f"### **'{search_keyword}'** 키워드 최신 뉴스 분석 결과")
-            
-            # 스피너에 요약 기능임을 명확히 표시
-            with st.spinner('⏳ Potens.ai API가 최신 뉴스 5개를 요약하고 있습니다... (최대 60초 소요)'):
-                response_text = get_potens_response(search_keyword)
-            
-            # API 오류 메시지 필터링 및 처리
-            if response_text.startswith("[API_ERROR:") or response_text.startswith("🚨"):
-                st.error("⚠️ 죄송합니다. API 호출 또는 응답 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.")
-            else:
-                st.markdown(response_text)
-                st.info(f"✨ '{search_keyword}'에 대한 뉴스 요약 5건이 완료되었습니다.")
-
-    with tab2:
-        st.subheader("개발자/디버깅 정보")
-        st.code(f"API URL: {API_URL}")
-        st.code(f"요청 키워드: {search_keyword}")
-        
-        if response_text.startswith("[API_ERROR:") or response_text.startswith("🚨"):
-             st.error(f"상세 오류 메시지: {response_text}")
-        else:
-             st.success("API 호출이 성공적으로 처리되었으며, 요약된 응답이 수신되었습니다.")
-             st.markdown("---")
-             st.caption("AI에게 전달된 프롬프트:")
-             st.code(f"다음 키워드: '{search_keyword}'에 대한 최신 뉴스나 기사를 5개 찾아서, 각 기사를 간결하게 요약해주고 출처나 주요 내용을 표시해줘. 전체적으로 하나의 마크다운 문단으로 깔끔하게 작성해줘.")
-        
-# --- 푸터 섹션 ---
-st.markdown("""
-    <div class="footer">AI 기반 정보 검색기 | Powered by Potens.ai</div>
-""", unsafe_allow_html=True)
+with col2:
+    st.subheader("📊 데이터 조회")
+    if not df_data.empty:
+        st.dataframe(df_data[['plan_date', 'line', 'category', 'product_name', 'quantity']])
